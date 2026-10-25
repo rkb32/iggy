@@ -44,6 +44,9 @@ bytes = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true }
 iggy = { workspace = true }
+# `with_binary_deadline`, which hands a Produce request's deadline to the SDK. The prelude does not
+# export it.
+iggy_common = { workspace = true }
 # The codec features stay on for the encoder, which the batch tests use to build fixtures.
 kafka-protocol = { workspace = true, features = ["gzip", "lz4", "snappy", "zstd"] }
 libc = { workspace = true }
