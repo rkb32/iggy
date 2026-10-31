@@ -1360,15 +1360,15 @@ class IggyClient:
         Raises:
             ValueError: If the expiry is invalid.
             PendingOperationError: If the reply is lost on TCP, QUIC, or WebSocket.
-                The token may exist with its value lost, and a retry with the same
-                name fails with code 51. Delete the token by name and create it
-                again. Until `delete_personal_access_token` is added, delete it
+                The token may exist with its value lost. A retry with the same name
+                fails with code 51. Delete the token by name, then create it again.
+                Until `delete_personal_access_token` is added, delete the token
                 through the HTTP API or another SDK.
-            RuntimeError: If the server refuses the request. On TCP, QUIC, and
-                WebSocket, an empty name or a name over 255 bytes raises code 4
-                before anything is sent. Names from 1 to 255 bytes reach the
-                server, which accepts them on TCP, QUIC, and WebSocket. On HTTP,
-                a name outside 3 to 30 bytes is refused with code 300.
+            RuntimeError: If the server refuses the request.
+                On TCP, QUIC, and WebSocket, an empty name or a name over 255 bytes
+                raises code 4 before anything is sent. On TCP, a name from 1 to
+                255 bytes is accepted. On HTTP, a name outside 3 to 30 bytes is
+                refused with code 300.
         """
     def get_user(
         self, user_id: builtins.str | builtins.int
