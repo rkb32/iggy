@@ -55,7 +55,7 @@ use crate::boot::threads::{
     install_panic_hook, join_partial_shard_survivors, resolve_shard_assignments, run_shard_thread,
     spawn_shutdown_watchdog, validate_sharding_runtime_knobs,
 };
-use crate::boot::topology::{RosterCells, resolve_tcp_topology};
+use crate::boot::topology::{RosterCells, replica_link_layout, resolve_tcp_topology};
 use crate::dispatch::reads::read_frontier_budget;
 use crate::dispatch::session_ops::warm_dummy_password_hash;
 use crate::server_error::ServerError;
@@ -295,6 +295,7 @@ pub fn bootstrap(
     install_default_crypto_provider();
     let mut root_credentials = resolve_root_credentials(&config)?;
     warm_dummy_password_hash();
+    crate::external_auth::preflight(&config.external_auth)?;
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
     crate::sysinfo_probe::init_stats_data_path(config.get_system_path().into());
@@ -340,7 +341,10 @@ pub fn bootstrap(
     // One owner table per server process, Arc-cloned into every shard's bus so
     // any shard's bus reads the same atomic slots that the owning
     // shard's installer / disconnect path writes.
-    let owner_table = Arc::new(ReplicaOwnerTable::new());
+    let owner_table = Arc::new(ReplicaOwnerTable::with_layout(replica_link_layout(
+        &config,
+        total_shards,
+    )?));
 
     // Single-shot bundle handoff (see `MetadataHandoff`): shard 0 sends
     // one cloned `ServerMetadataBundle` per peer; each peer drains
@@ -1034,6 +1038,10 @@ async fn shard_main(
         );
         let (accepted_replica, dialed_replica) =
             make_replica_delegation_fns(Rc::clone(&coord), &bus);
+        let close_coord = Rc::clone(&coord);
+        bus.set_replica_link_close_fn(Box::new(move |owner, link| {
+            close_coord.close_replica_link(owner, link);
+        }));
         let connections = Rc::new(client_connection_cap(config.message_bus.connections_max));
         let accepted_client = make_shard_zero_client_accept_fns(
             coord,

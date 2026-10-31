@@ -24,7 +24,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
@@ -110,12 +110,15 @@ use iggy_common::{
 };
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
-use secrecy::ExposeSecret;
 use secrecy::zeroize::Zeroizing;
+use secrecy::{ExposeSecret, SecretString};
 use send_wrapper::SendWrapper;
 use serde::Deserialize;
-use shard::{PartitionRead, PartitionReadReply};
+use shard::{
+    DeferredPollContext, DeferredPollRequest, PartitionRead, PartitionReadReply, PollQuotaIdentity,
+};
 
+use crate::dispatch::login_error::LoginRegisterError;
 use crate::dispatch::metadata_changes::metadata_changes_page;
 use crate::dispatch::partition::{
     ConsumerOffsetTarget, fence_poll_context, resolve_consumer_offset_request,
@@ -148,8 +151,8 @@ use crate::http::submit::{
     submit_committed, submit_write,
 };
 use crate::http::wire::{
-    consumer_offset_wire_request, delete_offset_wire_request, encode_send_messages,
-    poll_wire_request, store_offset_wire_request,
+    DeferredPollQuery, consumer_offset_wire_request, delete_offset_wire_request,
+    encode_send_messages, poll_wire_request, store_offset_wire_request,
 };
 use crate::reply_frame::{build_polled_messages_body, build_raw_pat_reply};
 use crate::responses::connected_client_to_response;
@@ -185,6 +188,7 @@ pub(in crate::http) async fn ping(State(_state): State<HttpState>) -> &'static s
 
 pub(in crate::http) async fn login_user(
     State(state): State<HttpState>,
+    ConnectInfo(client_addr): ConnectInfo<crate::http::ClientAddr>,
     Json(command): Json<LoginUser>,
 ) -> Result<Json<IdentityInfo>, CustomError> {
     // Credential verification is a consensus-free STM read; hold it while a
@@ -196,13 +200,30 @@ pub(in crate::http) async fn login_user(
     SendWrapper::new(crate::http::reads::await_recovery_barrier(&state.shard))
         .await
         .map_err(|_| IggyError::TransientNotAccepted)?;
-    let (user_id, created_at) = verify_login_credentials(
+
+    // verify_login_credentials handles not-caught-up (transient), unknown
+    // users (constant-cost dummy hash), and wrong passwords in one call.
+    match verify_login_credentials(
         &state.shard,
         &command.username,
         command.password.expose_secret(),
-    )
-    .map_err(|error| login_error_to_iggy(&error))?;
-    issue_identity(&state, user_id, created_at)
+    ) {
+        Ok((user_id, created_at)) => issue_identity(&state, user_id, created_at),
+        Err(LoginRegisterError::UserNotFound) if state.server_config.external_auth.enabled => {
+            if state.is_normal_primary() {
+                SendWrapper::new(try_external_auth_http_login(
+                    &state,
+                    &command.username,
+                    &command.password,
+                    &client_addr,
+                ))
+                .await
+            } else {
+                Err(IggyError::TransientNotAccepted.into())
+            }
+        }
+        Err(error) => Err(login_error_to_iggy(&error).into()),
+    }
 }
 
 pub(in crate::http) async fn login_with_personal_access_token(
@@ -1166,6 +1187,34 @@ pub(in crate::http) async fn delete_segments(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `GET /streams/{stream_id}/topics/{topic_id}/messages/deferred`: the poll of
+/// [`poll_messages`] with [`DeferredPollQuery`] limits. The primary holds it until
+/// `min_count` messages are ready, the reply reaches `max_bytes`, or `wait_us`
+/// expires. Invalid limits are refused before the poll is resolved.
+pub(in crate::http) async fn poll_messages_deferred(
+    State(state): State<HttpState>,
+    identity: Identity,
+    Path((stream_id, topic_id)): Path<(String, String)>,
+    Query(query): Query<PollMessages>,
+    Query(wait): Query<DeferredPollQuery>,
+    Query(consistency): Query<ConsistencyQuery>,
+    Extension(request): Extension<Arc<PartitionRequest>>,
+) -> Result<Response, ReadError> {
+    let options = iggy_common::DeferredPollOptions::from(wait);
+    options.validate(query.count).map_err(ReadError::Rejected)?;
+    poll_messages_impl(
+        state,
+        identity,
+        stream_id,
+        topic_id,
+        query,
+        consistency,
+        request,
+        Some(options),
+    )
+    .await
+}
+
 /// `GET /streams/{stream_id}/topics/{topic_id}/messages`: poll a batch of
 /// messages as the same `PolledMessages` JSON the legacy server returns. The
 /// query is the same flattened `PollMessages` shape the legacy server accepts
@@ -1191,6 +1240,35 @@ pub(in crate::http) async fn poll_messages(
     Query(consistency): Query<ConsistencyQuery>,
     Extension(request): Extension<Arc<PartitionRequest>>,
 ) -> Result<Response, ReadError> {
+    poll_messages_impl(
+        state,
+        identity,
+        stream_id,
+        topic_id,
+        query,
+        consistency,
+        request,
+        None,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Immediate and deferred polls share one authorization, fencing and relay path"
+)]
+#[allow(clippy::too_many_arguments)]
+async fn poll_messages_impl(
+    state: HttpState,
+    identity: Identity,
+    stream_id: String,
+    topic_id: String,
+    query: PollMessages,
+    consistency: ConsistencyQuery,
+    request: Arc<PartitionRequest>,
+    options: Option<iggy_common::DeferredPollOptions>,
+) -> Result<Response, ReadError> {
+    let started = std::time::Instant::now();
     let stream_id = Identifier::from_str_value(&stream_id).map_err(ReadError::Rejected)?;
     let topic_id = Identifier::from_str_value(&topic_id).map_err(ReadError::Rejected)?;
     let (consistency, metadata_floor) = SendWrapper::new(partition_read_consistency(
@@ -1275,19 +1353,47 @@ pub(in crate::http) async fn poll_messages(
         // member and names client 0, the HTTP read client.
         fence_poll_context(requested, local, HTTP_UNREGISTERED_CLIENT_ID, partition_id)
             .map_err(ReadError::Rejected)?;
-        let reply = state
-            .shard
-            .partition_read(
-                namespace,
-                PartitionRead::UnboundPollOnPrimary {
-                    consumer,
-                    args: args.clone(),
+        let read = if let Some(options) = options {
+            let mut options = options
+                .remaining(started.elapsed())
+                .map_err(ReadError::Rejected)?;
+            let remaining = request
+                .deadline
+                .saturating_duration_since(std::time::Instant::now());
+            options.request_timeout = options.request_timeout.get_duration().min(remaining).into();
+            // A binding HTTP deadline shortens the wait, not its reply margin.
+            options.max_wait = options
+                .max_wait
+                .get_duration()
+                .min(options.request_timeout.get_duration().saturating_sub(
+                    std::time::Duration::from_micros(
+                        iggy_common::MIN_DEFERRED_POLL_REPLY_MARGIN_US,
+                    ),
+                ))
+                .into();
+            PartitionRead::DeferredPoll(Box::new(DeferredPollRequest::new(
+                consumer,
+                args.clone(),
+                metadata,
+                DeferredPollContext {
+                    session: None,
                     user_id: identity.user_id,
-                    user_created_at: identity.user_created_at.as_micros(),
-                    metadata,
+                    user_created_at: Some(identity.user_created_at.as_micros()),
+                    quota: PollQuotaIdentity::User(identity.user_id),
+                    primary: true,
                 },
-            )
-            .await;
+                options,
+            )))
+        } else {
+            PartitionRead::UnboundPollOnPrimary {
+                consumer,
+                args: args.clone(),
+                user_id: identity.user_id,
+                user_created_at: identity.user_created_at.as_micros(),
+                metadata,
+            }
+        };
+        let reply = state.shard.partition_read(namespace, read).await;
         // The owner may already have auto-committed. At-most-once polls can
         // lose a batch here, but revoked credentials must never receive it.
         authorize_read(&state, &identity, consistency, rule)?;
@@ -2145,6 +2251,65 @@ fn issue_identity(
             expiry: generated.access_token_expiry,
         }),
     }))
+}
+
+/// Try external auth callout for an HTTP password login and, on success,
+/// resolve the returned username to a pre-provisioned Iggy user.
+async fn try_external_auth_http_login(
+    state: &HttpInner,
+    username: &str,
+    password: &SecretString,
+    client_addr: &crate::http::ClientAddr,
+) -> Result<Json<IdentityInfo>, CustomError> {
+    use crate::external_auth::{
+        Credentials, ExternalAuthRequest, HTTP_TRANSPORT, ValidatedDecision, callout_external_auth,
+    };
+
+    let ext_config = &state.server_config.external_auth;
+    let client_address = client_addr.addr.to_string();
+    let connection_id = uuid::Uuid::now_v7().to_string();
+    let ext_request = ExternalAuthRequest {
+        transport: HTTP_TRANSPORT,
+        client_address: &client_address,
+        connection_id: &connection_id,
+        credentials: Credentials::UsernamePassword { username, password },
+    };
+
+    let decision = callout_external_auth(ext_config, ext_request)
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "external auth callout failed");
+            if error.is_transient() {
+                IggyError::TransientNotAccepted
+            } else {
+                IggyError::InvalidCredentials
+            }
+        })?;
+
+    match decision {
+        ValidatedDecision::Allow {
+            username: ext_username,
+        } => {
+            let (user_id, created_at) = state
+                .shard
+                .plane
+                .metadata()
+                .mux_stm
+                .users()
+                .read(|users| crate::external_auth::resolve_username(users, &ext_username))
+                .inspect_err(|_| {
+                    tracing::warn!(
+                        ext_username = %ext_username,
+                        "ext-auth user resolution failed"
+                    );
+                })?;
+            issue_identity(state, user_id, created_at)
+        }
+        ValidatedDecision::Deny { reason } => {
+            tracing::warn!(reason = %reason, "external auth denied login");
+            Err(IggyError::InvalidCredentials.into())
+        }
+    }
 }
 
 #[cfg(test)]

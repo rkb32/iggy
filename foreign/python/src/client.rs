@@ -447,6 +447,45 @@ impl IggyClient {
         })
     }
 
+    /// Creates a personal access token for the authenticated user.
+    ///
+    /// The token is returned once, so store it when the call completes.
+    /// `IggyExpiry.ServerDefault()` and `IggyExpiry.NeverExpire()` create a
+    /// token that never expires.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to the raw token as `str`.
+    ///
+    /// Raises:
+    ///     ValueError: If the expiry is invalid.
+    ///     PendingOperationError: If the reply is lost on TCP, QUIC, or WebSocket.
+    ///         The token may exist with its value lost. A retry with the same name
+    ///         fails with code 51. Delete the token by name, then create it again.
+    ///         Until `delete_personal_access_token` is added, delete the token
+    ///         through the HTTP API or another SDK.
+    ///     RuntimeError: If the server refuses the request.
+    ///         On TCP, QUIC, and WebSocket, an empty name or a name over 255 bytes
+    ///         raises code 4 before anything is sent. On TCP, a name from 1 to
+    ///         255 bytes is accepted. On HTTP, a name outside 3 to 30 bytes is
+    ///         refused with code 300.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[str]", imports=("collections.abc")))]
+    fn create_personal_access_token<'a>(
+        &self,
+        py: Python<'a>,
+        name: String,
+        expiry: &IggyExpiry,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let expiry = RustIggyExpiry::try_from(expiry)?;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let token = inner
+                .create_personal_access_token(&name, expiry)
+                .await
+                .map_err(to_runtime_error)?;
+            Ok(token.token)
+        })
+    }
+
     /// Get the info about a specific user by unique ID or username.
     ///
     /// Args:
@@ -1773,10 +1812,11 @@ impl IggyClient {
     /// Creates a new consumer group consumer.
     /// `partition_id` is ignored for a consumer group: the member reads the partitions
     /// the server assigns to it.
+    /// `auto_commit` defaults to `AutoCommit.Disabled()`: the consumer stores no offset,
+    /// so store positions after processing, or each restart reads the same messages again.
     /// Returns the consumer or a RuntimeError on failure. Raises `ValueError` if
-    /// `poll_interval`, `polling_retry_interval`, `init_retry_interval` or an
-    /// `AutoCommit` interval is negative, or if any of those except `poll_interval`
-    /// is zero.
+    /// `polling_retry_interval`, `init_retry_interval` or an `AutoCommit` interval
+    /// is negative or zero.
     ///
     /// Consumer groups are not available over HTTP. With `auto_join_consumer_group`
     /// left on, this call fails at the join with `Feature is unavailable`.
@@ -1797,7 +1837,7 @@ impl IggyClient {
         auto_commit=None,
         create_consumer_group_if_not_exists=true,
         auto_join_consumer_group=true,
-        poll_interval=None,
+        *,
         polling_retry_interval=None,
         init_retries=None,
         init_retry_interval=None,
@@ -1820,8 +1860,6 @@ impl IggyClient {
         >,
         create_consumer_group_if_not_exists: bool,
         auto_join_consumer_group: bool,
-        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
-        poll_interval: Option<Py<PyDelta>>,
         #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
         polling_retry_interval: Option<Py<PyDelta>>,
         #[gen_stub(override_type(type_repr = "builtins.int | None"))] init_retries: Option<u32>,
@@ -1854,11 +1892,6 @@ impl IggyClient {
         };
         if let Some(auto_commit) = auto_commit {
             builder = builder.auto_commit(RustAutoCommit::try_from(auto_commit)?)
-        };
-        if let Some(poll_interval) = poll_interval {
-            builder = builder.poll_interval(py_delta_to_iggy_duration(&poll_interval)?)
-        } else {
-            builder = builder.without_poll_interval()
         };
         if let Some(polling_retry_interval) = polling_retry_interval {
             builder = builder.polling_retry_interval(reject_zero(
